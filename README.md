@@ -6,23 +6,23 @@ Mutex server.
 
 ```bash
 # development
-$ yarn run start
+$ yarn start
 
 # watch mode
-$ npm run start:dev
+$ yarn start:dev
 
 # production mode
-$ npm run start:prod
+$ yarn start:prod
 ```
 
 ## Docker
 
 ```bash
-# unit tests
+# building
 $ docker build . -t mutex
 
 # runnig docker instance
-$ docker run --rm -p 3000:3000 mutex
+$ docker run --rm --name mutex -p 3000:3000 mutex
 
 ```
 
