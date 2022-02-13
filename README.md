@@ -21,7 +21,7 @@ $ yarn start:prod
 # building
 $ docker build . -t mutex
 
-# runnig docker instance
+# running docker instance
 $ docker run --rm --name mutex -p 3000:3000 mutex
 
 ```
