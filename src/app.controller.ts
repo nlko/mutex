@@ -1,81 +1,145 @@
 import {
   Controller,
   Get,
+  Logger,
   Param,
-  RequestTimeoutException
+  Query,
+  Req,
+  RequestTimeoutException,
 } from '@nestjs/common';
+import { Request } from 'express';
 import { adjust, max, min, propEq, remove } from 'ramda';
-import { Observable, of } from 'rxjs';
-import { catchError, timeout } from 'rxjs/operators';
-import { Informer, State } from 'storyx';
+import { Observable, ReplaySubject, Subject, of, timeout } from 'rxjs';
+import { catchError, first, map, scan } from 'rxjs/operators';
 import { v4 as uuidv4 } from 'uuid';
 
-const MAXIMUM_TIMEOUT = process.env.MAXIMUM_TIMEOUT || 20000;
-const DEFAULT_TIMEOUT = process.env.DEFAULT_TIMEOUT || 10000;
+const MAXIMUM_TIMEOUT = process.env.MAXIMUM_TIMEOUT
+  ? parseInt(process.env.MAXIMUM_TIMEOUT)
+  : 20000;
+const DEFAULT_TIMEOUT = process.env.DEFAULT_TIMEOUT
+  ? parseInt(process.env.DEFAULT_TIMEOUT)
+  : 10000;
 
-@Controller()
-export class AppController {
-  state = new State<Record<string, any>>({});
+interface MutexItem {
+  uuid: string;
+  inform: ReplaySubject<string>;
+  running: boolean;
+  date: Date;
+}
+type Mutexes = Record<string, MutexItem[]>;
 
-  constructor() {
-    this.state.obs$.subscribe((state) => {
-      Object.keys(state).forEach((id) => {
-        if (state[id].length && !state[id][0].running) {
-          this.state.update((state) => {
-            const newId = adjust(
-              0,
-              (item) => {
-                item.inform.inform(item.uuid);
-                return { ...item, running: true };
-              },
-              state[id],
-            );
+type Commands =
+  | { tag: 'append'; name: string; mutexItem: MutexItem }
+  | { tag: 'remove'; name: string; uuid: string };
 
-            return {
-              ...state,
-              [id]: newId,
-            };
-          });
-        }
-      });
-    });
-  }
+const adjustState = (state: Mutexes): Mutexes => {
+  return Object.keys(state).reduce((acc, name) => {
+    const elems = state[name];
 
-  private append = (id, newVal) => (stateContent) => {
-    return {
-      ...stateContent,
-      [id]: stateContent[id] ? [...stateContent[id], newVal] : [newVal],
-    };
-  };
+    if (elems.length && !elems[0].running) {
+      const newElems = adjust(
+        0,
+        (item: MutexItem): MutexItem => {
+          item.inform.next(item.uuid);
+          item.inform.complete();
+          return { ...item, running: true };
+        },
+        elems,
+      );
 
-  private remove = (id, uuid) => (state) => {
-    if (!state[id]) return state;
+      return { ...acc, [name]: newElems };
+    }
+    return acc;
+  }, {});
+};
 
-    const idx = state[id].findIndex(propEq('uuid', uuid));
-    if (idx < 0) return state;
-
-    const newList = remove(idx, 1, state[id]);
+const appendMutexItem =
+  (name: string, mutexItem: MutexItem) =>
+  (state: Mutexes): Mutexes => {
+    const prevMutexState = state[name] ?? [];
 
     return {
       ...state,
-      [id]: newList,
+      [name]: [...prevMutexState, mutexItem],
     };
   };
 
-  wait(name: string, timeOut = DEFAULT_TIMEOUT): Observable<string> {
-    const inform = new Informer<string>();
+const removeMutexItem =
+  (name: string, uuid: string) =>
+  (state: Mutexes): Mutexes => {
+    if (!state[name]) return state;
+
+    const idx = state[name].findIndex(propEq('uuid', uuid));
+    if (idx < 0) return state;
+
+    const newList = remove(idx, 1, state[name]);
+
+    return {
+      ...state,
+      [name]: newList,
+    };
+  };
+
+@Controller()
+export class AppController {
+  state$s = new Subject<Commands>();
+  state$: Observable<Mutexes> = this.state$s.pipe(
+    scan((state, command): Mutexes => {
+      this.loggerService.verbose(command);
+      if (command.tag == 'append') {
+        return appendMutexItem(command.name, command.mutexItem)(state);
+      } else if (command.tag == 'remove') {
+        return removeMutexItem(command.name, command.uuid)(state);
+      }
+      return state;
+    }, {}),
+    map(adjustState),
+  );
+
+  constructor(private loggerService: Logger) {
+    // The state machine must run
+    this.state$.subscribe((mutexes) => {});
+  }
+
+  wait(
+    name: string,
+    options: {
+      mutexTimeout?: number;
+      url?: string;
+    } = {},
+  ): Observable<string> {
+    const inform = new ReplaySubject<string>(1);
     const uuid = uuidv4();
 
-    this.state.updater$s.next(
-      this.append(name, { uuid, inform, running: false, date: null }),
+
+    this.state$s.next({
+      tag: 'append',
+      name,
+      mutexItem: { uuid, inform, running: false, date: new Date(Date.now()) },
+    });
+
+    const realTimeout = max(
+      0,
+      min(options.mutexTimeout ?? DEFAULT_TIMEOUT, MAXIMUM_TIMEOUT),
     );
 
-    const realTimeout = max(0, min(timeOut, MAXIMUM_TIMEOUT));
+    this.loggerService.log(
+      `Waiting ${name} / ${uuid} (timeout ${realTimeout})`,
+    );
 
-    return inform.obs$.pipe(
-      timeout(realTimeout) as any,
+    return inform.pipe(
+      timeout(realTimeout),
+      first(),
+      map((uuid) => {
+        this.loggerService.log(`Aquired ${name} / ${uuid}`);
+        if (options.url) {
+          return [options.url, uuid].join('/');
+        }
+        return uuid;
+      }),
       catchError((err) => {
-        this.state.updater$s.next(this.remove(name, uuid));
+        this.loggerService.log(`Rejecting ${name} / ${uuid}`);
+        this.state$s.next({ tag: 'remove', name, uuid });
 
         throw new RequestTimeoutException();
       }) as any,
@@ -83,18 +147,34 @@ export class AppController {
   }
 
   @Get(':name')
-  get_mutex(@Param('name') name): Observable<string> {
-    return this.wait(name);
+  get_mutex(
+    @Param('name') name,
+    @Query('url') urlFormat,
+    @Query('timeout') timeout,
+    @Req() req: Request,
+  ): Observable<string> {
+
+    const mutexTimeout = parseInt(timeout);
+
+    this.loggerService.verbose(`mutexTimeout: ${mutexTimeout}`);
+
+    const url = urlFormat
+      ? `${req.protocol}://${req.headers.host}/${name}`
+      : undefined;
+
+    this.loggerService.verbose(`url: ${url}`);
+
+    return this.wait(name, {
+      mutexTimeout: isNaN(mutexTimeout) ? DEFAULT_TIMEOUT : mutexTimeout,
+      url,
+    });
   }
 
   @Get(':name/:uuid')
   signal(@Param('name') name, @Param('uuid') uuid): Observable<void | string> {
-    if (isNaN(uuid)) {
-      this.state.updater$s.next(this.remove(name, uuid));
+    this.loggerService.log(`Releasing ${name} / ${uuid}`);
+    this.state$s.next({ tag: 'remove', name, uuid });
 
-      return of(void 0);
-    }
-
-    return this.wait(name, parseInt(uuid));
+    return of(void 0);
   }
 }

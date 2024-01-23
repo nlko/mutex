@@ -1,7 +1,7 @@
 {
   "name": "mutex",
-  "version": "0.0.2",
-  "description": "prevent concurent access to ressource",
+  "version": "0.0.3",
+  "description": "prevent concurrent access to ressource",
   "author": "N. THOMASSON",
   "private": true,
   "license": "MIT",
@@ -28,7 +28,6 @@
     "reflect-metadata": "^0.1.13",
     "rimraf": "^3.0.2",
     "rxjs": "^7.4.0",
-    "storyx": "^2.2.4",
     "uuid": "^8.0.0"
   },
   "devDependencies": {

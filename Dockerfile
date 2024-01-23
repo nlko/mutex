@@ -1,29 +1,40 @@
-from node:lts-alpine as build
+FROM node:lts-alpine as node_modules_for_prod
 
-workdir /app
+WORKDIR /app
 
-copy *.json /app/
-copy yarn.lock /app/
+COPY *.json /app/
+COPY yarn.lock /app/
 
-run yarn
+RUN yarn --prod
 
-copy src /app
+FROM node:lts-alpine as node_modules_for_dev
 
-run yarn build
+COPY --from=node_modules_for_prod /app /app
 
-from node:lts-alpine
+WORKDIR /app
 
-expose 3000
+RUN yarn
 
-workdir /app
+FROM node:lts-alpine as build
 
-run yarn global add nodemon
+COPY --from=node_modules_for_dev /app /app
 
-copy *.json /app/
-copy yarn.lock /app/
+WORKDIR /app
 
-run yarn --prod
+COPY src /app
 
-copy --from=build /app/dist /app/
+RUN yarn build
 
-cmd nodemon main.js
+FROM node:lts-alpine as prod
+
+RUN yarn global add nodemon
+
+COPY --from=node_modules_for_prod /app /app
+
+COPY --from=build /app/dist /app/
+
+WORKDIR /app
+
+EXPOSE 3000
+
+CMD nodemon main.js
